@@ -197,3 +197,41 @@ Method lesson, twice earned in one day: a control is only a control if the
 variable you care about is actually held. "CPU is coherent" meant "CPU with
 f16-K is coherent" — the quantized-K CPU cell was never run, and its absence
 cost two failed kernel-fix attempts aimed at hardware that was never broken.
+
+## 10. Late-session results (2026-07-07, second half)
+
+**Rotation made correct, not just disabled.** Branch
+[`ds4-rotation-aware`](https://github.com/Mermiges/llama.cpp/tree/ds4-rotation-aware)
+implements upstream-issue fix options b+c: the fallback path's rotation math corrected
+(block-wise application + output un-rotation) and the sparse CSA/HCA paths made
+rotation-aware, with the rotation re-enabled for the architecture. Verified: full K/V-type
+matrix coherent with rotation ON; ~6.8% decode cost from the added rotation matmuls.
+Notably, in a ~6000-token needle screen with q8_0-K, **rotation-ON retrieved the needle
+while rotation-OFF (plain q8_0-K) missed it** — the incoherence rotation visibly earning
+its keep on long context (single unseeded run; directional, not decision-grade).
+
+**Hybrid-island topology: negative result.** A 6-GPU config (2-GPU NVLink pair + one
+4-GPU board) predicted faster by the fewer-cards trend measured **9.22 ± 0.21 tg128 —
+24% slower** than the 8-GPU baseline (12.09 ± 0.09 tg128; note the §7 "12.89" is tg64).
+Cause: the pair cards are the lower-power LS variant behind a worse PCIe path, and a
+sequential decode pipeline is gated by its slowest links. The fewer-cards rule holds only
+within homogeneous, well-connected sets; on this fleet the 8-GPU two-quad config is the
+optimum, full stop.
+
+**Tensor parallelism: from "blacklisted" to one assert from tokens.** llama.cpp's modern
+TP rejects all MLA architectures at model creation. An experimental branch
+([`ds4-tensor-parallel`](https://github.com/Mermiges/llama.cpp/tree/ds4-tensor-parallel))
+fixed the two architectural blockers (kv-cache split planning keyed to a tensor DS4
+doesn't have; no replicated-attention path in the TP framework) — after which the model
+**loads on 8 GPUs at 24.3 GB/card, builds its graph, and reaches decode**, stopping at a
+scheduler assert in the MoE all-reduce subgraph. Assert chain fully mapped; work parked
+pending a validation window. Expectation stands that TP loses to layer-split on
+single-stream decode here (host-staged cross-board all-reduce); the interesting
+applications are prefill and single-quad configs for smaller models.
+
+**Where the next decode tier lives.** Three independent measurements converge: decode is
+latency-bound on per-layer launches and cross-GPU syncs (each added card costs ~0.84 t/s;
+the inter-card boundary copy lives outside CUDA-graph capture; the sparse indexer runs as
+a long generic-op chain per layer). The highest-upside path is porting the fused indexer
+kernels (the donor fork carries an sm_70-safe non-tensor-core path); that campaign is in
+progress and results will be published here.

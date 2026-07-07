@@ -1,0 +1,44 @@
+From c1a456ce51bdec4afa0e2754bef46b5b628eeeae Mon Sep 17 00:00:00 2001
+From: DS4TP Fable <noreply@anthropic.com>
+Date: Tue, 7 Jul 2026 05:50:25 +0000
+Subject: [PATCH 1/2] llama : opt-in de-blacklist DeepSeek-V4 for
+ SPLIT_MODE_TENSOR (experiment)
+
+Env-gated (LF_DS4_TP_EXPERIMENT=1) so default behavior is byte-for-byte upstream.
+DS4 is blacklisted from tensor-parallel in llm_arch_supports_sm_tensor() because the
+split-state descriptor has no rules for MLA/indexer tensors. But those unmatched tensors
+fall to the MIRRORED (replicated) default (enum 10 >= GGML_MAX_DIMS, so they skip the
+segment/granularity asserts), and only the routed-expert FFN (ffn_*_exps) is tensor-split.
+That yields textbook column->row parallel FFN with a replicated attention block, which the
+meta backend already supports. This flag lets us smoke-test that hybrid for DS4 without
+changing any default path.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-arch.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 7e77acef1..7447f9a8c 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -977,6 +977,16 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+ }
+ 
+ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
++    // DS4TP experiment: DeepSeek-V4 (and the whole MLA/DeepSeek family) is blacklisted from
++    // SPLIT_MODE_TENSOR upstream because the split-state descriptor has no rules for the MLA
++    // tensors (attn_q_a/q_b/kv_a_mqa/kv_b/k_b/v_b) or the lightning-indexer tensors. Those
++    // unmatched tensors fall to the MIRRORED (replicated) default, which SHOULD be correct:
++    // attention runs replicated on every card while the fat MoE expert FFN (ffn_*_exps) is the
++    // only thing tensor-split + all-reduced. Gate the de-blacklist behind an env flag so the
++    // default stays exactly as upstream and this stays an opt-in experiment.
++    if (arch == LLM_ARCH_DEEPSEEK4 && getenv("LF_DS4_TP_EXPERIMENT") != nullptr) {
++        return true;
++    }
+     switch (arch) {
+         case LLM_ARCH_GROK:
+         case LLM_ARCH_MPT:
+-- 
+2.43.0
+

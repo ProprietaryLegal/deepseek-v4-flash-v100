@@ -1,0 +1,84 @@
+From 5ae0447cd91d61d31213a3a976555874de0ba533 Mon Sep 17 00:00:00 2001
+From: DS4TP Fable <noreply@anthropic.com>
+Date: Tue, 7 Jul 2026 06:00:57 +0000
+Subject: [PATCH 2/2] meta: MLA replicated-attention TP path for DeepSeek-V4
+ (clears 2 arch asserts)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Empirically driven by loading DS4 under -sm tensor with LF_DS4_TP_EXPERIMENT=1 on 4x V100.
+De-blacklist alone hits two arch-level asserts; both are the single-KV-head MLA vs the TP
+framework's head-split assumption:
+
+1. llama-model.cpp:424 GGML_ASSERT(!suffix_fallback.empty()) — the MLA kv-cache (cache_k/v_l*)
+   matched pattern_kv_cache and tried to key its split on "attn_output.weight", which DS4 does
+   not have (its output proj is LoRA-factored attn_out_a/attn_out_b). Fix: for DEEPSEEK4, split
+   ONLY the routed-expert FFN (ffn_*_exps) and MIRROR every other tensor (the experts-split /
+   attention-replicated hybrid). No suffix lookup -> no assert.
+
+2. ggml-backend-meta.cpp:748 handle_flash_attn_ext GGML_ASSERT(src_ss[0].axis == AXIS_2) — the TP
+   propagator hard-requires head-split (axis-2) Q/K/V. MLA's single KV head cannot be head-split,
+   so under the hybrid Q/K/V are MIRRORED. Fix: add a replicated-attention branch — all-MIRRORED
+   Q/K/V -> MIRRORED output (every device computes the full attention identically).
+
+Remaining wall on 4 cards is NOT arch-level: meta-backend:474 requires all tensors on the meta
+(split) device, so partial CPU offload is incompatible with -sm tensor; and DS4 (155GB) does not
+fit 4x32GB fully resident. Full end-to-end validation (coherence + tg + any further asserts on the
+MoE all-reduce / indexer paths) needs an 8-card full-residency run. Default behavior unchanged
+(all gated by LF_DS4_TP_EXPERIMENT).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-meta.cpp | 12 ++++++++++++
+ src/llama-model.cpp            | 11 +++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index d27f0d266..c453103fa 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -745,6 +745,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     };
+ 
+     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        // Replicated-attention (MLA) path: when Q/K/V are all MIRRORED, every device holds the
++        // full attention and computes an identical result, so the output is MIRRORED too. This is
++        // the DeepSeek-V4 hybrid TP case — MLA has a single KV head and cannot be head-split
++        // (axis 2), so attention is replicated and only the routed-expert FFN is tensor-split. The
++        // mask (src[3]) must be mirrored; sinks (src[4]), if present, mirrored as well.
++        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++        }
+         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 48eee5078..3d153c16f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -429,6 +429,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     };
+ 
+     auto get_tensor_config = [&]() -> tensor_config {
++        // DS4TP hybrid: DeepSeek-V4 is pure-MoE with MLA (1 KV head) + a LoRA-factored output
++        // projection (attn_out_a/attn_out_b, NOT "attn_output.weight") and a sparse lightning
++        // indexer. The generic rules below route the MLA kv-cache / qk_norm / sinks to key off a
++        // non-existent "attn_output.weight" and assert (llama-model.cpp:424). MLA is also
++        // un-splittable head-wise (single KV head) and cheap enough to replicate. So for DS4 we
++        // tensor-split ONLY the routed-expert FFN (ffn_*_exps) and MIRROR everything else — the
++        // exact experts-split / attention-replicated hybrid. The _exps tensors fall through to the
++        // FFN rules (which carry a "_exps" fallback and never hit the null-suffix assert).
++        if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && tensor_name.find("_exps") == std::string::npos) {
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        }
+         // standard attention
+         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+-- 
+2.43.0
+

@@ -87,7 +87,7 @@ contexts, not speed.
 | [`evidence/isolation-exec-log.md`](evidence/isolation-exec-log.md) | Raw execution log of the root-cause lane (every probe, honest first-hypothesis failure included) |
 | [`evidence/bench/`](evidence/bench/) | Raw `llama-bench` outputs with build SHAs |
 | [`evidence/quality-screens/`](evidence/quality-screens/) | Quality-screen transcripts (legal-drafting probes + needle retrieval) |
-| [`patches/`](patches/) | The fail-loud guard as `git am`-able patch against llama.cpp `v100-unified` |
+| [`patches/`](patches/) | `git am`-able patch sets: the minimal fix + guard (root), the **rotation-aware proper fix** ([`patches/rotation-aware/`](patches/rotation-aware/), branch [`ds4-rotation-aware`](https://github.com/Mermiges/llama.cpp/tree/ds4-rotation-aware)), and the **tensor-parallel de-blacklist experiments** ([`patches/tensor-parallel/`](patches/tensor-parallel/), branch [`ds4-tensor-parallel`](https://github.com/Mermiges/llama.cpp/tree/ds4-tensor-parallel)) |
 | [`tools/quality_screen.py`](tools/quality_screen.py) | Stdlib-only quality screen used for the PASS/FAIL gates (empty completions fail loudly) |
 
 ## Why PLI Labs does this

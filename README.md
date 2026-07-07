@@ -25,23 +25,31 @@ Output verified coherent at temperature 0, through a legal-drafting quality
 screen and verbatim needle retrieval from multi-thousand-token prompts
 (transcripts in [`evidence/quality-screens/`](evidence/quality-screens/)).
 
-## The bug you need to know about
+## The bug you need to know about — UPDATED: it affects EVERY backend, not just Volta
 
-With a **quantized K-cache** (`--cache-type-k q8_0`), DeepSeek-V4-Flash on
-Volta loads cleanly, serves a green `/health`, and emits **confident
-gibberish** — no CUDA error, nothing in the logs. A controlled one-variable
-matrix (two sha256-verified quants, CPU control, architecture control,
-single-GPU K/V-type sweep) pinned it: corruption occurs **iff the K-cache is
-quantized**, independent of FlashAttention mode and V-cache type. DeepSeek's
-MLA stores an unusually wide K row (head dim 576 = 512 latent + 64 RoPE); the
-q8_0 K path for that shape is numerically wrong on sm_70.
+With a **quantized K-cache** (`--cache-type-k q8_0`), DeepSeek-V4-Flash loads
+cleanly, serves a green `/health`, and emits **confident gibberish** — no
+error, nothing in the logs. Our first root cause blamed a Volta (sm_70)
+kernel; continued investigation **disproved that**: the identical garbage
+reproduces on **CPU-only** inference, and the suspect GPU kernels all pass
+isolated numeric tests. Upstream issue:
+[ggml-org/llama.cpp#25382](https://github.com/ggml-org/llama.cpp/issues/25382).
 
-**Fix:** run `--cache-type-k f16`. The MLA K-cache is small; the cost is
-negligible. The [`patches/`](patches/) directory ships a fail-loud guard
-(also on the [`ds4-volta-fix`](https://github.com/Mermiges/llama.cpp/tree/ds4-volta-fix)
-branch) that refuses the broken configuration at startup instead of serving
-garbage. Full analysis, including two failed kernel-level fixes published as
-negative results: [`docs/research-notes.md`](docs/research-notes.md).
+The real mechanism is graph-level: a quantized K-cache enables llama.cpp's
+Hadamard "incoherence rotation," and the mere presence of that rotation
+**diverts DeepSeek-V4 off its designed sparse attention paths** into a
+fallback that applies the rotation with the wrong matmul primitive and never
+un-rotates the MLA V-view output. Full trail, including our own wrong first
+attribution kept for the record: [`docs/research-notes.md`](docs/research-notes.md)
+and [`evidence/`](evidence/).
+
+**Operational fix (any build):** run `--cache-type-k f16` — negligible cost,
+MLA's cache is tiny by design. **Code fix (verified):** the
+[`ds4-volta-fix`](https://github.com/Mermiges/llama.cpp/tree/ds4-volta-fix)
+branch (patches in [`patches/`](patches/)) disables the rotation for this
+architecture; the full 4-cell K/V matrix is coherent after it — quantized-K
+becomes usable again ([`evidence/ds4fix-live-matrix-20260707.md`](evidence/ds4fix-live-matrix-20260707.md)).
+A deeper fix making the sparse paths rotation-aware is in progress.
 
 ## Quickstart
 

@@ -1,0 +1,71 @@
+From b5bec92216fe897fadd498311f0e98b6b3522f6e Mon Sep 17 00:00:00 2001
+From: Nick <mermiges@gmail.com>
+Date: Tue, 7 Jul 2026 04:47:21 +0000
+Subject: [PATCH 3/4] llama : disable KV Hadamard rotation for DeepSeek-V4
+ (fixes quantized K-cache)
+
+A quantized K/V cache enables the Hadamard "attention rotation"
+(attn_rot_k/attn_rot_v, incoherence pre-processing), which allocates
+self_k_rot. DeepSeek-V4's attention dispatch requires self_k_rot == nullptr to
+use its trained sparse CSA / HCA / lightning-indexer attention; a non-null
+self_k_rot silently diverts every layer onto build_raw_attention, which
+mis-applies the rotation (plain ggml_mul_mat instead of the block-wise
+ggml_mul_mat_aux, and never un-rotates the MLA V-is-K-view output before the
+v_mla up-projection). Result: confident gibberish from --cache-type-k q8_0 on
+ALL backends (verified identical on CPU and CUDA/Volta) -- NOT a Volta kernel
+defect as first assumed.
+
+Disable the rotation for LLM_ARCH_DEEPSEEK4 so quantized K/V flows through the
+correct sparse attention with plain (near-lossless) q8_0 and no incoherence
+pre-processing. f16 caches never enabled the rotation, so they are unaffected.
+Also let LLAMA_ATTN_ROT_DISABLE override the otherwise-forced indexer rotation,
+so the corruption can be reproduced/diagnosed via that env var.
+
+Proper long-term fix (teach the sparse paths to apply/undo the rotation, or fix
+build_raw_attention) is larger and left for upstream.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-kv-cache.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 12bf5c379..b89ded4f8 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -339,7 +339,9 @@ llama_kv_cache::llama_kv_cache(
+             hparams.n_embd_head_k() % 64 == 0;
+ 
+         // always create Hadamard rotation tensors for DeepSeek lightning indexers
+-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
++        // (LLAMA_ATTN_ROT_DISABLE overrides this too, for diagnosing the quantized-K corruption)
++        if (!attn_rot_disable &&
++                (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
+                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+             attn_rot_k = true;
+         }
+@@ -349,6 +351,21 @@ llama_kv_cache::llama_kv_cache(
+             n_embd_head_v_all > 0 &&
+             ggml_is_quantized(type_v) &&
+             hparams.n_embd_head_v() % 64 == 0;
++
++        // DeepSeek-V4: the Hadamard incoherence rotation is not correctly integrated with this
++        // model's attention. Enabling it (which only happens for a quantized K/V cache) allocates
++        // self_k_rot, which forces every layer off the designed sparse CSA/HCA/lightning-indexer
++        // paths (they require self_k_rot==nullptr) onto build_raw_attention, whose rotation handling
++        // is broken (plain ggml_mul_mat instead of the block-wise ggml_mul_mat_aux, and no
++        // un-rotation of the MLA V-is-K-view output before the v_mla up-projection). The result is
++        // confident gibberish on ALL backends (verified CPU + CUDA/Volta). Until the sparse paths
++        // learn to apply/undo the rotation, disable it here so quantized K/V flows through the
++        // correct attention with plain (near-lossless) q8_0. f16 caches never enabled rotation, so
++        // they are unaffected. See exec-logs/2026-07-07-ds4kernel-fable-execlog.md.
++        if (model.arch == LLM_ARCH_DEEPSEEK4) {
++            attn_rot_k = false;
++            attn_rot_v = false;
++        }
+     }
+ 
+     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
+-- 
+2.43.0
+

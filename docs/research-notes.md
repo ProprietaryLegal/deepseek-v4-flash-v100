@@ -122,11 +122,27 @@ prefill (−11% at 8K) and generation (−5.4%) for M3, and is a correctness
 hazard for DeepSeek MLA. Quantized KV remains a VRAM lever only for very long
 contexts.
 
-Scaling note: one llama.cpp process cannot currently use more than 8 of these
-GPUs — CUDA's 8-peer-mapping limit aborts allocation (`peer mapping resources
-exhausted`) because the VMM pool grants every device access to every pool.
-10/12-GPU runs on a `GGML_CUDA_NO_VMM=ON` build are in progress and will be
-added here.
+### Scaling ladder and batch tuning (completed 2026-07-07)
+
+CUDA's 8-peer-mapping limit aborts >8-GPU allocation on the default build
+(`peer mapping resources exhausted` — the VMM pool grants every device access
+to every pool). A `GGML_CUDA_NO_VMM=ON` build crosses the limit; measured
+results (same flags, `-r 3`):
+
+| GPUs | DS4 pp512 | DS4 pp8192 | DS4 tg128 |
+|---:|---:|---:|---:|
+| 8 (two NVLink quads) | 228.3 | 209.2 | 12.2 |
+| 10 (+ 2-GPU NVLink pair) | 204.6 | 190.1 | 11.5 |
+| 14 (four islands) | 119.5 | 113.4 | 7.8 |
+
+Layer-split activations cross island boundaries over PCIe; past two islands
+the hops dominate. **8 GPUs on two NVLink quads is the throughput optimum**;
+extra cards buy only KV headroom for very long contexts.
+
+Batch sweep (8-GPU, `-b 2048`): `-ub 1024` is the serving optimum — DS4
+tg 12.89 ± 0.07 (+5.5% over `-ub 512`) at pp8192 205.4 ± 2.1; MiniMax-M3
+gains similarly (pp8K ~299 t/s, tg ~33.6). Recommended launch flags:
+`-b 2048 -ub 1024` for both models.
 
 ## 8. Reproduction
 

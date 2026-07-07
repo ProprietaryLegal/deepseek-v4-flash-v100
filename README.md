@@ -11,10 +11,15 @@ DeepSeek-family MLA models on quantized K-caches under CC 7.0 should read.
 8× V100-SXM2-32GB (one node, two NVLink quad boards, power-capped 245 W/GPU),
 llama.cpp layer split, FlashAttention on, f16 KV-cache, `llama-bench -r 3`:
 
-| model | pp512 t/s | pp8192 t/s | tg128 t/s |
+| model | pp512 t/s | pp8192 t/s | tg t/s |
 |---|---:|---:|---:|
 | **DeepSeek-V4-Flash UD-Q4_K_XL** | **228.3 ± 0.3** | **209.2 ± 1.1** | **12.2 ± 0.1** |
+| **DeepSeek-V4-Flash, tuned batching** (`-b 2048 -ub 1024`) | — | 205.4 ± 2.1 | **12.9 ± 0.1** |
 | MiniMax-M3 UD-Q2_K_XL (same rig, comparison) | 280.1 ± 10.8 | 269.7 ± 7.5 | 31.2 ± 0.4 |
+| MiniMax-M3, tuned batching | — | ~299 | ~33.6 |
+
+Batch-size sweep verdict: `-b 2048 -ub 1024` is the best serving config for
+both models (+5–6% generation over the initial `-b 1024 -ub 512`).
 
 Output verified coherent at temperature 0, through a legal-drafting quality
 screen and verbatim needle retrieval from multi-thousand-token prompts
@@ -47,7 +52,7 @@ cmake --build build --target llama-server llama-bench -j
 
 build/bin/llama-server \
   -m DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf \
-  -ngl 999 -sm layer -fa 1 -b 1024 -ub 512 -c 8192 \
+  -ngl 999 -sm layer -fa 1 -b 2048 -ub 1024 -c 8192 \
   --cache-type-k f16 --cache-type-v f16
 ```
 
@@ -57,9 +62,14 @@ manifest before serving; both failure investigations here started by ruling
 the weights out that way.
 
 Hard rules on this hardware: **layer split only** (`-sm layer`), **f16
-K-cache** (correctness), fp16 compute (no bf16/FP8 on Volta), and a maximum of
-**8 GPUs per process** (CUDA's peer-mapping limit; >8-GPU results on a no-VMM
-build are in progress).
+K-cache** (correctness), fp16 compute (no bf16/FP8 on Volta), and **8 GPUs is
+the sweet spot**. CUDA's peer-mapping limit aborts >8 GPUs on the default
+build (`peer mapping resources exhausted`); a `GGML_CUDA_NO_VMM=ON` build
+crosses the limit, but the measured scaling ladder says don't bother for
+these models: 10 GPUs ≈ par with 8 (DS4 tg 11.5 vs 12.2), and 14 GPUs
+**halves** throughput (DS4 113 pp8K / 7.8 tg) once the split spans four
+PCIe-hopped NVLink islands. More cards buy KV headroom for very long
+contexts, not speed.
 
 ## Repo map
 
